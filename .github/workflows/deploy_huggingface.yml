@@ -1,0 +1,27 @@
+name: Deploy backend to Hugging Face Space
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE: renan-b-eth/rendey-class
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git remote add hf https://renan-b-eth:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE}.git
+          git push hf main:main --force
