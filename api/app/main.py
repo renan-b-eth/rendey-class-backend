@@ -2,11 +2,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 import os
 import httpx
 import json
 import asyncio
+import hashlib
+import time
 
 try:
     from .core.rag import retrieve_top_chunks, format_retrieved_context
@@ -20,6 +22,9 @@ except Exception:
     AGENTS = {}
 
 app = FastAPI(title="Rendey Class API", version="0.2.1")
+
+_RAG_CACHE: Dict[str, Dict[str, Any]] = {}
+_RATE_BUCKET: Dict[str, List[float]] = {}
 
 # -----------------------------
 # CORS (Front-end on Vercel)
@@ -63,18 +68,47 @@ def _agents_list():
     return []
 
 @app.get("/api/v1/agents")
-def list_agents_v1():
+def list_agents_v1(request: Request):
+    _require_internal_key(request)
     return _agents_list()
 
 # ✅ Alias para facilitar o front: /agents
 @app.get("/agents")
-def list_agents_alias():
+def list_agents_alias(request: Request):
+    _require_internal_key(request)
     return _agents_list()
 
 # -----------------------------
 # LLM Engines
 # -----------------------------
 Engine = Literal["FOUNDRY", "NVIDIA"]
+
+def _optional(name: str) -> str:
+    return (os.getenv(name) or "").strip()
+
+
+def _require_internal_key(request: Request):
+    expected = _optional("AGENTS_INTERNAL_API_KEY")
+    if not expected:
+        return
+    got = (request.headers.get("x-agents-key") or "").strip()
+    if got != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _rate_limit(request: Request, *, scope: str, limit: int = 30, window_seconds: int = 60):
+    ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip() or (request.client.host if request.client else "")
+    key = f"{scope}:{ip}"
+    now = time.time()
+    w = float(window_seconds)
+    max_hits = int(limit)
+
+    hits = _RATE_BUCKET.get(key) or []
+    hits = [t for t in hits if (now - t) <= w]
+    if len(hits) >= max_hits:
+        raise HTTPException(status_code=429, detail="Rate limit")
+    hits.append(now)
+    _RATE_BUCKET[key] = hits
 
 def _required(name: str) -> str:
     v = (os.getenv(name) or "").strip()
@@ -181,7 +215,7 @@ async def _call_nvidia_stream(messages: List[Dict[str, str]], temperature: float
         yield delta
 
 
-def _rag_context(query: str, req: "AgentRunRequest") -> str:
+async def _rag_context(query: str, req: "AgentRunRequest") -> str:
     if not retrieve_top_chunks or not format_retrieved_context:
         return ""
 
@@ -199,13 +233,129 @@ def _rag_context(query: str, req: "AgentRunRequest") -> str:
     chunks = retrieve_top_chunks(
         query=query,
         sources=sources,
-        top_k=7,
+        top_k=30,
         chunk_chars=1400,
         overlap=220,
         min_score=0.03,
-        dedupe_threshold=0.86,
+        dedupe_threshold=0.92,
     )
+
+    base_url = _optional("EMBEDDINGS_API_BASE_URL")
+    model = _optional("EMBEDDINGS_MODEL") or "text-embedding-3-small"
+    api_key = _optional("EMBEDDINGS_API_KEY")
+
+    if base_url and chunks:
+        try:
+            texts = [query] + [c.text[:1800] for c in chunks]
+            vectors = await _embed_texts(base_url, api_key, model, texts)
+            if vectors and len(vectors) == len(texts):
+                qv = vectors[0]
+                dv = vectors[1:]
+
+                max_lex = max([c.score for c in chunks] + [1e-9])
+                reranked = []
+                for ch, vec in zip(chunks, dv):
+                    emb = _cos_sim(qv, vec)
+                    lex = float(ch.score) / float(max_lex)
+                    score = (0.62 * emb) + (0.38 * lex)
+                    reranked.append((score, ch))
+                reranked.sort(key=lambda x: x[0], reverse=True)
+                chunks = [ch for _, ch in reranked[:12]]
+        except Exception:
+            pass
+
+    chunks = chunks[:7]
     return format_retrieved_context(chunks, max_chars=9000)
+
+
+def _cos_sim(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for i in range(n):
+        x = float(a[i])
+        y = float(b[i])
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+async def _embed_texts(base_url: str, api_key: str, model: str, texts: List[str]) -> List[List[float]]:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        url = f"{base}/embeddings"
+    else:
+        url = f"{base}/v1/embeddings"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {"model": model, "input": texts}
+    timeout = httpx.Timeout(30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, headers=headers, json=payload)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=500, detail=f"Embeddings error {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    out: List[List[float]] = []
+    items = data.get("data") or []
+    for item in items:
+        out.append(item.get("embedding") or [])
+    if len(out) != len(texts):
+        raise HTTPException(status_code=500, detail="Embeddings returned unexpected length")
+    return out
+
+
+def _structured_from_markdown(md: str) -> Dict[str, Any]:
+    text = (md or "").strip()
+    lines = [l.rstrip() for l in text.splitlines()]
+    title = None
+    for l in lines[:12]:
+        s = l.strip()
+        if s.startswith("#"):
+            title = s.lstrip("#").strip()
+            break
+    if not title:
+        for l in lines[:12]:
+            s = l.strip()
+            if len(s) >= 4:
+                title = s
+                break
+
+    sections: List[Dict[str, Any]] = []
+    cur = None
+    for l in lines:
+        s = l.strip()
+        if s.startswith("## "):
+            if cur:
+                cur["content"] = "\n".join(cur["content"]).strip()
+                sections.append(cur)
+            cur = {"title": s[3:].strip(), "content": []}
+            continue
+        if cur is not None:
+            cur["content"].append(l)
+    if cur:
+        cur["content"] = "\n".join(cur["content"]).strip()
+        sections.append(cur)
+
+    checklist: List[str] = []
+    for sec in sections:
+        if "checklist" in (sec.get("title") or "").lower():
+            for l in (sec.get("content") or "").splitlines():
+                ls = l.strip()
+                if ls.startswith("-"):
+                    checklist.append(ls.lstrip("-").strip())
+
+    return {
+        "title": title,
+        "sections": sections,
+        "checklist": checklist,
+    }
 
 async def _call_nvidia(messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
     url = _nvidia_chat_url()
@@ -242,14 +392,31 @@ class AgentRunResponse(BaseModel):
     ok: bool = True
     engineUsed: Engine
     output: str
+    structured: Optional[Dict[str, Any]] = None
 
 @app.post("/api/v1/agents/run", response_model=AgentRunResponse)
-async def run_agent_v1(req: AgentRunRequest):
+async def run_agent_v1(req: AgentRunRequest, request: Request):
+    _require_internal_key(request)
+    _rate_limit(request, scope="agents_run", limit=int(_optional("AGENTS_RUN_RPM") or "30"), window_seconds=60)
     agent_id = req.agent
     system = _agent_system_prompt(agent_id)
 
     user_content = req.prompt.strip()
-    rag_context = _rag_context(user_content, req)
+
+    ctx_key = hashlib.sha1(
+        ("|".join([
+            user_content,
+            req.use_context,
+            (req.classroom_context or ""),
+            (req.student_context or ""),
+        ])).encode("utf-8", "ignore")
+    ).hexdigest()
+    cached = _RAG_CACHE.get(ctx_key)
+    if cached and (time.time() - float(cached.get("ts") or 0)) < float(_optional("RAG_CACHE_TTL_SECONDS") or "600"):
+        rag_context = str(cached.get("ctx") or "")
+    else:
+        rag_context = await _rag_context(user_content, req)
+        _RAG_CACHE[ctx_key] = {"ts": time.time(), "ctx": rag_context}
     if rag_context:
         user_content = (
             user_content
@@ -274,19 +441,37 @@ async def run_agent_v1(req: AgentRunRequest):
     engine = req.engine or "FOUNDRY"
     if engine == "NVIDIA":
         output = await _call_nvidia(messages, temperature=req.temperature)
-        return AgentRunResponse(engineUsed="NVIDIA", output=output or "")
+        structured = _structured_from_markdown(output or "")
+        return AgentRunResponse(engineUsed="NVIDIA", output=output or "", structured=structured)
 
     output = await _call_foundry(messages, temperature=req.temperature)
-    return AgentRunResponse(engineUsed="FOUNDRY", output=output or "")
+    structured = _structured_from_markdown(output or "")
+    return AgentRunResponse(engineUsed="FOUNDRY", output=output or "", structured=structured)
 
 
 @app.post("/api/v1/agents/run/stream")
 async def run_agent_stream_v1(req: AgentRunRequest, request: Request):
+    _require_internal_key(request)
+    _rate_limit(request, scope="agents_stream", limit=int(_optional("AGENTS_STREAM_RPM") or "20"), window_seconds=60)
     agent_id = req.agent
     system = _agent_system_prompt(agent_id)
 
     user_content = req.prompt.strip()
-    rag_context = _rag_context(user_content, req)
+    ctx_key = hashlib.sha1(
+        ("|".join([
+            "stream",
+            user_content,
+            req.use_context,
+            (req.classroom_context or ""),
+            (req.student_context or ""),
+        ])).encode("utf-8", "ignore")
+    ).hexdigest()
+    cached = _RAG_CACHE.get(ctx_key)
+    if cached and (time.time() - float(cached.get("ts") or 0)) < float(_optional("RAG_CACHE_TTL_SECONDS") or "600"):
+        rag_context = str(cached.get("ctx") or "")
+    else:
+        rag_context = await _rag_context(user_content, req)
+        _RAG_CACHE[ctx_key] = {"ts": time.time(), "ctx": rag_context}
     if rag_context:
         user_content = (
             user_content
@@ -365,8 +550,8 @@ async def run_agent_stream_v1(req: AgentRunRequest, request: Request):
 
 # ✅ Alias para facilitar o front: /agents/run
 @app.post("/agents/run", response_model=AgentRunResponse)
-async def run_agent_alias(req: AgentRunRequest):
-    return await run_agent_v1(req)
+async def run_agent_alias(req: AgentRunRequest, request: Request):
+    return await run_agent_v1(req, request)
 
 
 @app.post("/agents/run/stream")
