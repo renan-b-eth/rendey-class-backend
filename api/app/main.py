@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Literal
 import os
 import httpx
 import json
+import asyncio
 
 try:
     from .core.rag import retrieve_top_chunks, format_retrieved_context
@@ -186,15 +187,25 @@ def _rag_context(query: str, req: "AgentRunRequest") -> str:
 
     sources = []
     if req.use_context in ("classroom", "both"):
-        sources.append(("TURMA", req.classroom_context))
+        if (req.classroom_context or "").strip():
+            sources.append(("TURMA", req.classroom_context, 1.0))
     if req.use_context in ("student", "both"):
-        sources.append(("ALUNO", req.student_context))
+        if (req.student_context or "").strip():
+            sources.append(("ALUNO", req.student_context, 1.15))
 
     if not sources:
         return ""
 
-    chunks = retrieve_top_chunks(query=query, sources=sources, top_k=7, chunk_chars=1400, overlap=200, min_score=0.03)
-    return format_retrieved_context(chunks)
+    chunks = retrieve_top_chunks(
+        query=query,
+        sources=sources,
+        top_k=7,
+        chunk_chars=1400,
+        overlap=220,
+        min_score=0.03,
+        dedupe_threshold=0.86,
+    )
+    return format_retrieved_context(chunks, max_chars=9000)
 
 async def _call_nvidia(messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
     url = _nvidia_chat_url()
@@ -270,7 +281,7 @@ async def run_agent_v1(req: AgentRunRequest):
 
 
 @app.post("/api/v1/agents/run/stream")
-async def run_agent_stream_v1(req: AgentRunRequest):
+async def run_agent_stream_v1(req: AgentRunRequest, request: Request):
     agent_id = req.agent
     system = _agent_system_prompt(agent_id)
 
@@ -299,17 +310,44 @@ async def run_agent_stream_v1(req: AgentRunRequest):
 
     engine = req.engine or "FOUNDRY"
 
+    ping_interval = float((os.getenv("SSE_PING_INTERVAL_SECONDS") or "15").strip() or "15")
+    stream_wait_timeout = float((os.getenv("SSE_STREAM_WAIT_TIMEOUT_SECONDS") or "120").strip() or "120")
+
     async def gen():
         yield f"data: {json.dumps({'type': 'meta', 'engineUsed': engine}, ensure_ascii=False)}\n\n"
+        last_activity = asyncio.get_event_loop().time()
+
+        async def emit_ping():
+            yield ": ping\n\n"
+
         try:
             if engine == "NVIDIA":
-                async for delta in _call_nvidia_stream(messages, temperature=req.temperature):
-                    yield f"data: {json.dumps({'type': 'delta', 'delta': delta}, ensure_ascii=False)}\n\n"
-                yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
-                return
+                it = _call_nvidia_stream(messages, temperature=req.temperature).__aiter__()
+            else:
+                it = _call_foundry_stream(messages, temperature=req.temperature).__aiter__()
 
-            async for delta in _call_foundry_stream(messages, temperature=req.temperature):
-                yield f"data: {json.dumps({'type': 'delta', 'delta': delta}, ensure_ascii=False)}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    return
+
+                idle = asyncio.get_event_loop().time() - last_activity
+                if idle > stream_wait_timeout:
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'timeout aguardando resposta do modelo'}, ensure_ascii=False)}\n\n"
+                    return
+
+                try:
+                    delta = await asyncio.wait_for(it.__anext__(), timeout=ping_interval)
+                except asyncio.TimeoutError:
+                    async for p in emit_ping():
+                        yield p
+                    continue
+                except StopAsyncIteration:
+                    break
+
+                if delta:
+                    last_activity = asyncio.get_event_loop().time()
+                    yield f"data: {json.dumps({'type': 'delta', 'delta': delta}, ensure_ascii=False)}\n\n"
+
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
         except Exception as e:
             msg = str(getattr(e, "detail", None) or str(e) or "stream error")
@@ -332,8 +370,8 @@ async def run_agent_alias(req: AgentRunRequest):
 
 
 @app.post("/agents/run/stream")
-async def run_agent_stream_alias(req: AgentRunRequest):
-    return await run_agent_stream_v1(req)
+async def run_agent_stream_alias(req: AgentRunRequest, request: Request):
+    return await run_agent_stream_v1(req, request)
 
 # -----------------------------
 # Legacy demo endpoint (mock)
